@@ -8,7 +8,8 @@ from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 import time
 import locale
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry  # Новый вариант импорта
+from urllib3.util.retry import Retry
+import threading
 
 # Настройки
 locale.setlocale(locale.LC_TIME, 'ru_RU.UTF-8')
@@ -51,7 +52,7 @@ def load_schedule():
         print(f"Ошибка загрузки JSON: {e}")
         return []
 
-def load_custom_replacements():
+def load_custom_replacements_raw():
     """Загружает пользовательские замены."""
     if not os.path.exists(CUSTOM_REPLACEMENTS_FILE):
         return {}
@@ -62,34 +63,45 @@ def load_custom_replacements():
         print(f"Ошибка загрузки кастомных замен: {e}")
         return {}
 
+def load_custom_replacements():
+    """Загружает актуальные пользовательские замены."""
+    custom = load_custom_replacements_raw()
+    today = datetime.now().strftime("%Y-%m-%d")
+    return {k: v for k, v in custom.get(GROUP_NAME, {}).items() if v.get('date') == today}
+
 def save_custom_replacements(data):
     """Сохраняет пользовательские замены."""
     with open(CUSTOM_REPLACEMENTS_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+def save_custom_replacement(pair, data):
+    """Сохраняет одну пользовательскую замену."""
+    custom = load_custom_replacements_raw()
+    if GROUP_NAME not in custom:
+        custom[GROUP_NAME] = {}
+    custom[GROUP_NAME][pair] = {
+        'name': data['name'],
+        'cab': data['cab'],
+        'date': datetime.now().strftime("%Y-%m-%d")  # Добавляем дату замены
+    }
+    save_custom_replacements(custom)
+
 def parse_website_date():
-    """
-    Парсит дату и день недели с сайта.
-    Ожидается строка вида: 
-      "в расписании на 5 февраля 2025 года / среда"
-    """
+    """Парсит дату и день недели с сайта."""
     try:
         response = SESSION.get(URL, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
-        # Ищем <div> с текстом, содержащим "расписании на"
-        date_div = soup.find('div', align='center', string=lambda x: x and 'расписании на' in x)
+        date_div = soup.find('div', align='center', string=lambda x: x and 'расписании на' in x.lower())
         if date_div:
             try:
-                # Разбиваем строку по "на" и затем по "/"
                 part = date_div.text.split("на", 1)[1].strip()
                 date_str, day_str = part.split("/", 1)
                 date = datetime.strptime(date_str.strip(), "%d %B %Y года")
                 cache['date'] = date
                 cache['last_update'] = datetime.now()
-                return date, day_str.strip().lower()  # day_str, например, "среда"
+                return date, day_str.strip().lower()
             except Exception as inner_e:
                 print(f"Ошибка парсинга строки даты: {inner_e}")
-        # Если не удалось спарсить, возвращаем кэшированную дату или текущую
         return cache['date'] or datetime.now(), None
     except Exception as e:
         print(f"Ошибка парсинга даты: {e}")
@@ -138,82 +150,101 @@ def fetch_replacements():
 def get_merged_replacements():
     """Объединяет замены с сайта и пользовательские."""
     site_replacements = fetch_replacements()
-    custom_replacements = load_custom_replacements().get(GROUP_NAME, {})
+    custom_replacements = load_custom_replacements()
     return {**site_replacements, **custom_replacements}
 
 def get_week_type():
     """Определяет тип недели (числитель/знаменатель)."""
     try:
         response = SESSION.get(URL, timeout=10)
+        response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
-        week_info = soup.find('div', align='center').text
         
-        if 'числитель' in week_info.lower():
-            cache['week_type'] = 'числитель'
-        elif 'знаменатель' in week_info.lower():
-            cache['week_type'] = 'знаменатель'
-        else:
-            cache['week_type'] = 'числитель'  # значение по умолчанию
-            
-        print(f"DEBUG: week_type = {cache['week_type']}")
-        return cache['week_type']
+        divs = soup.find_all('div', align='center')
+        week_type = None
+        for div in divs:
+            text = div.get_text().lower()
+            if "числитель" in text:
+                week_type = "числитель"
+                break
+            elif "знаменатель" in text:
+                week_type = "знаменатель"
+                break
+                
+        if not week_type:
+            week_type = "числитель"
+        cache['week_type'] = week_type
+        return week_type
     except Exception as e:
         print(f"Ошибка определения типа недели: {e}")
         current_week = (cache['date'] or datetime.now()).isocalendar()[1]
-        cache['week_type'] = "числитель" if current_week % 2 else "знаменатель"
-        print(f"DEBUG: week_type (fallback) = {cache['week_type']}")
-        return cache['week_type']
+        week_type = "числитель" if current_week % 2 else "знаменатель"
+        cache['week_type'] = week_type
+        return week_type
 
 def format_schedule(day_schedule, replacements):
     """Форматирует расписание с учетом замен."""
-    if not day_schedule:
-        return "Занятий нет"
-    
     output = []
     
-    # Специальное уведомление для 2 пары, если есть замена
-    if '2' in replacements:
-        replacement = replacements['2']
-        output.append(
-            "⚠️ *ВНИМАНИЕ! Замена 2 пары:*\n"
-            f"🔄 Пара 2: *{replacement['name']}* \n"
-            f"Кабинет: {replacement['cab']}\n"
-            "―――――――――――――――――――"
-        )
+    # Обработка 2 пары только при наличии данных
+    lesson_2 = day_schedule.get('2', {})
+    replacement_2 = replacements.get('2', {})
     
-    for pair_num in sorted(day_schedule.keys(), key=lambda x: int(x)):
-        lesson = day_schedule[pair_num]
-        if pair_num in replacements:
-            replacement = replacements[pair_num]
+    # Проверяем, есть ли реальные данные для отображения
+    has_original = any(lesson_2.values())  # Проверка name/teacher/cab
+    has_replacement = any(replacement_2.values())
+    
+    if has_replacement or has_original:
+        if replacement_2:
             output.append(
-                f"🔄 Пара {pair_num}: *{replacement['name']}* \n"
-                f"Кабинет: {replacement['cab']}\n"
+                "⚠️ *ЗАМЕНА ДЛЯ 2 ПАРЫ:*\n"
+                f"🔄 *{replacement_2.get('name', '')}* \n"
+                f"Кабинет: {replacement_2.get('cab', '')}\n"
                 "―――――――――――――――――――"
             )
         else:
             output.append(
-                f"📘 Пара {pair_num}: *{lesson['name']}* \n"
-                f"Преподаватель: {lesson['teacher']} \n"
-                f"Кабинет: {lesson['cab']}\n"
+                f"📘 Пара 2: *{lesson_2.get('name', '')}*\n"
+                f"Преподаватель: {lesson_2.get('teacher', '')}\n"
+                f"Кабинет: {lesson_2.get('cab', '')}\n"
                 "―――――――――――――――――――"
             )
-    return "\n".join(output)
+    
+    # Обработка остальных пар
+    for pair_num in sorted(day_schedule.keys(), key=lambda x: int(x)):
+        if pair_num == '2':  # Уже обработали
+            continue
+            
+        lesson = day_schedule[pair_num]
+        replacement = replacements.get(pair_num, {})
+        
+        if replacement:
+            output.append(
+                f"🔄 Пара {pair_num}: *{replacement.get('name', '')}*\n"
+                f"Кабинет: {replacement.get('cab', '')}\n"
+                "―――――――――――――――――――"
+            )
+        else:
+            output.append(
+                f"📘 Пара {pair_num}: *{lesson.get('name', '')}*\n"
+                f"Преподаватель: {lesson.get('teacher', '')}\n"
+                f"Кабинет: {lesson.get('cab', '')}\n"
+                "―――――――――――――――――――"
+            )
+    
+    return "\n".join(output) if output else "Занятий нет"
 
 def get_schedule(day_offset=0):
-    """Формирует расписание на указанный день.
-    
-    Если day_offset == 0, используется день недели, взятый из сайта (из строки расписания).
-    Если day_offset != 0, прибавляется смещение к дате с сайта и вычисляется день недели стандартным способом.
-    """
+    """Формирует расписание на указанный день."""
+    cache['replacements'] = None
+    cache['date'] = None
     try:
         schedule = load_schedule()
         replacements = get_merged_replacements()
         
         base_date, website_day = parse_website_date()
-        # Для запроса "сегодня" используем день с сайта, а для "завтра" – прибавляем смещение
         if day_offset == 0:
             if website_day:
-                # Приводим первую букву к заглавной (например, "среда" -> "Среда")
                 target_day = website_day.capitalize()
             else:
                 days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
@@ -223,10 +254,8 @@ def get_schedule(day_offset=0):
             days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
             target_day = days[target_date.weekday()]
         
-        print(f"DEBUG: target_day = {target_day}")
         week_type = get_week_type()
         
-        # Ищем расписание для нужного дня в списке JSON
         for entry in schedule:
             if target_day in entry:
                 day_schedule = entry[target_day].get(week_type, {})
@@ -254,6 +283,28 @@ def send_welcome(message):
         reply_markup=markup
     )
 
+@bot.message_handler(commands=['add_replacement'])
+def handle_add_replacement(message):
+    """Обработчик команды добавления замены."""
+    if message.from_user.id not in ADMINS:
+        return
+    
+    msg = bot.send_message(message.chat.id, "Введите номер пары и замену в формате:\n`3 Математика 207`", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_replacement)
+
+def process_replacement(message):
+    """Обрабатывает ввод замены."""
+    try:
+        parts = message.text.split()
+        pair_num = parts[0]
+        subject = ' '.join(parts[1:-1])
+        classroom = parts[-1]
+        
+        save_custom_replacement(pair_num, {'name': subject, 'cab': classroom})
+        bot.send_message(message.chat.id, f"✅ Замена для пары {pair_num} сохранена!")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)}")
+
 @bot.message_handler(func=lambda m: True)
 def handle_message(message):
     """Обработчик текстовых сообщений."""
@@ -271,17 +322,26 @@ def handle_message(message):
             schedule_text = get_schedule(0)
             status = f"\n\n🔄 Данные обновлены: {cache['last_update'].strftime('%H:%M:%S') if cache['last_update'] else 'недоступны'}"
             bot.send_message(message.chat.id, schedule_text + status, parse_mode="Markdown")
-            
         elif message.text.lower() == "завтра":
             schedule_text = get_schedule(1)
             status = f"\n\n🔄 Данные обновлены: {cache['last_update'].strftime('%H:%M:%S') if cache['last_update'] else 'недоступны'}"
             bot.send_message(message.chat.id, schedule_text + status, parse_mode="Markdown")
-            
         else:
             bot.send_message(message.chat.id, "ℹ️ Используйте кнопки для выбора")
-            
     except Exception as e:
         bot.send_message(message.chat.id, "⚠️ Сервер с расписанием временно недоступен. Попробуйте позже.")
+
+# -------------------------------
+# Фоновые задачи
+# -------------------------------
+
+def background_updater():
+    """Фоновая задача для обновления данных."""
+    while True:
+        print("Обновление данных...")
+        fetch_replacements()
+        parse_website_date()
+        time.sleep(300)  # Каждые 5 минут
 
 # -------------------------------
 # Запуск бота
@@ -289,6 +349,10 @@ def handle_message(message):
 
 if __name__ == '__main__':
     print("Бот запущен...")
+    updater_thread = threading.Thread(target=background_updater)
+    updater_thread.daemon = True
+    updater_thread.start()
+    
     while True:
         try:
             bot.polling(none_stop=True, interval=1, timeout=60)
