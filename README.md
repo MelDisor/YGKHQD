@@ -35,7 +35,7 @@
 
 4. Запустите бота:
    ```bash
-   python bot.py
+   python telbot.py
    ```
 
 ## Основные компоненты кода
