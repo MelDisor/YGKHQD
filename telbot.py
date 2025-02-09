@@ -17,8 +17,8 @@ JSON_FILE = 'test23.json'
 CUSTOM_REPLACEMENTS_FILE = 'custom_replacements.json'
 URL = "https://menu.sttec.yar.ru/timetable/rasp_second.html"
 GROUP_NAME = "ИБ1-41"
-TOKEN = '7584041622:AAEdU7SqMJIybhemrlPpIwfeZKt8TXr3MNQ'
-ADMINS = [879554693]  # Замените на ваш chat_id
+TOKEN = ''
+ADMINS = []  # Замените на ваш chat_id
 
 # Настройка повторных попыток для HTTP-запросов
 SESSION = requests.Session()
