@@ -27,7 +27,7 @@
    pip install requests python-telegram-bot beautifulsoup4
    ```
 
-3. Создайте файл `telbot.py` и добавьте в него токен вашего бота:
+3. Откроете `telbot.py` и добавьте в него токен вашего бота:
    ```python
    TOKEN = 'ВАШ_ТОКЕН'
    ADMINS = [123456789]  # Замените на ваш Telegram chat_id
